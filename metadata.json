@@ -1,0 +1,5 @@
+{
+  "name": "Smart Calendar Sync",
+  "description": "An intelligent assistant that parses IM messages to automatically create or update Google Calendar events, handling deduplication and schedule changes.",
+  "requestFramePermissions": []
+}
