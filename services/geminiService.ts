@@ -1,8 +1,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { GeminiResponse, LocalEventRecord, ActionType } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
 const SYSTEM_INSTRUCTION = `
 You are a smart calendar assistant. 
 Your job is to analyze incoming Instant Messenger (IM) texts and manage a calendar.
@@ -24,11 +22,29 @@ Rules for Time:
 - If no duration is specified, assume 1 hour.
 `;
 
+export interface GeminiConfig {
+  apiKey?: string;
+  baseUrl?: string;
+}
+
 export const analyzeMessage = async (
   message: string,
-  existingEvents: LocalEventRecord[]
+  existingEvents: LocalEventRecord[],
+  config?: GeminiConfig
 ): Promise<GeminiResponse> => {
   
+  // Use provided key, or fallback to env var
+  const apiKey = config?.apiKey || process.env.API_KEY;
+  if (!apiKey) {
+    throw new Error("Gemini API Key is missing. Please set it in the code or environment.");
+  }
+
+  // Initialize SDK dynamically to support Base URL (Proxy) changes
+  const ai = new GoogleGenAI({ 
+    apiKey: apiKey,
+    baseUrl: config?.baseUrl // Allows routing requests through a proxy
+  });
+
   const now = new Date();
   const contextPrompt = `
     Current Date/Time: ${now.toISOString()} (${now.toLocaleDateString('en-US', { weekday: 'long' })})

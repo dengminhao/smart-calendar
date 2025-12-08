@@ -9,6 +9,7 @@ import { LocalEventRecord, ProposedAction, ActionType } from './types';
 // Storage key
 const STORAGE_KEY = 'smart_calendar_events_v1';
 const CLIENT_ID_STORAGE_KEY = 'smart_calendar_client_id';
+const BASE_URL_STORAGE_KEY = 'smart_calendar_base_url';
 
 const App: React.FC = () => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -19,10 +20,16 @@ const App: React.FC = () => {
   const [localEvents, setLocalEvents] = useState<LocalEventRecord[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   
-  // Auth configuration state
+  // Auth & Config state
   const [clientId, setClientId] = useState(() => {
     return process.env.GOOGLE_CLIENT_ID || localStorage.getItem(CLIENT_ID_STORAGE_KEY) || '';
   });
+  
+  // Proxy / Base URL state
+  const [geminiBaseUrl, setGeminiBaseUrl] = useState(() => {
+    return process.env.GEMINI_BASE_URL || localStorage.getItem(BASE_URL_STORAGE_KEY) || '';
+  });
+
   const [showConfig, setShowConfig] = useState(false);
   const [currentOrigin, setCurrentOrigin] = useState('');
   const [isSandboxed, setIsSandboxed] = useState(false);
@@ -62,6 +69,15 @@ const App: React.FC = () => {
     }
   }, [clientId]);
 
+  // Save configs when closed
+  const handleCloseConfig = () => {
+    if (clientId) localStorage.setItem(CLIENT_ID_STORAGE_KEY, clientId);
+    if (geminiBaseUrl) localStorage.setItem(BASE_URL_STORAGE_KEY, geminiBaseUrl);
+    else localStorage.removeItem(BASE_URL_STORAGE_KEY);
+    
+    setShowConfig(false);
+  };
+
   const handleAuth = async () => {
     setErrorMsg(null);
     
@@ -74,7 +90,7 @@ const App: React.FC = () => {
     // Ensure service uses current ID
     try {
        calendarService.current.initializeGis(clientId);
-       localStorage.setItem(CLIENT_ID_STORAGE_KEY, clientId); // Save for later
+       localStorage.setItem(CLIENT_ID_STORAGE_KEY, clientId); 
     } catch (e) {
        console.error(e);
        setErrorMsg("Invalid Client ID format or GIS not ready.");
@@ -104,7 +120,10 @@ const App: React.FC = () => {
 
     try {
       // Pass localEvents as context so AI knows what exists
-      const result = await analyzeMessage(inputText, localEvents);
+      // Pass dynamic config for Base URL (Proxy)
+      const result = await analyzeMessage(inputText, localEvents, {
+        baseUrl: geminiBaseUrl || undefined
+      });
       setProposedActions(result.actions);
     } catch (err: any) {
       setErrorMsg(err.message || "Failed to analyze text.");
@@ -208,7 +227,7 @@ const App: React.FC = () => {
                       onClick={() => setShowConfig(!showConfig)}
                       className="text-xs text-slate-400 hover:text-sky-600 underline"
                     >
-                      {showConfig ? 'Hide Config' : 'Configure Client ID (Optional)'}
+                      {showConfig ? 'Hide Config' : 'Configure Settings'}
                     </button>
 
                     <button
@@ -225,9 +244,11 @@ const App: React.FC = () => {
                     </button>
                  </div>
 
-                 {/* Client ID Input */}
+                 {/* Configuration Panel */}
                  {showConfig && (
                   <div className="flex flex-col items-end w-full max-w-sm animate-fade-in mt-2 bg-white p-4 rounded-lg border border-slate-200 shadow-xl z-20 absolute top-20 right-0 md:relative md:top-0 md:right-0">
+                     
+                     {/* Client ID */}
                      <label className="text-xs text-slate-500 mb-1 w-full text-left font-semibold">Google Client ID</label>
                      <input 
                        type="text" 
@@ -237,16 +258,24 @@ const App: React.FC = () => {
                        className="w-full text-sm border border-slate-300 rounded px-2 py-1 focus:ring-2 focus:ring-sky-500 focus:outline-none mb-3"
                      />
                      
+                     {/* Gemini Base URL (Proxy) */}
+                     <label className="text-xs text-slate-500 mb-1 w-full text-left font-semibold">Gemini Base URL (Optional)</label>
+                     <input 
+                       type="text" 
+                       value={geminiBaseUrl}
+                       onChange={(e) => setGeminiBaseUrl(e.target.value)}
+                       placeholder="https://my-proxy.com (Default: Google)"
+                       className="w-full text-sm border border-slate-300 rounded px-2 py-1 focus:ring-2 focus:ring-sky-500 focus:outline-none mb-3"
+                     />
+                     <div className="text-[10px] text-slate-400 w-full text-left mb-3">
+                       Use this to route AI requests through a proxy (e.g., http://localhost:8080).
+                     </div>
+
                      <div className="bg-slate-50 p-2 rounded border border-slate-200 w-full mb-3 text-left">
-                       <p className="text-[10px] text-slate-400 uppercase tracking-wider font-bold mb-1">Copy to "Authorized JavaScript origins":</p>
+                       <p className="text-[10px] text-slate-400 uppercase tracking-wider font-bold mb-1">Origin for Client ID:</p>
                        <code className="text-xs text-slate-700 bg-white border border-slate-200 px-1 py-0.5 rounded block break-all select-all">
                          {currentOrigin || 'Loading...'}
                        </code>
-                     </div>
-
-                     <div className="text-[10px] text-amber-600 bg-amber-50 p-2 rounded mb-3 text-left leading-tight">
-                        <strong>Tip:</strong> If you see "Error 400: redirect_uri_mismatch" or "storagerelay", ensure the origin above exactly matches your Console settings. 
-                        If running in a code editor preview, try opening the app in a new window.
                      </div>
 
                      <div className="flex justify-between w-full mt-1 items-center">
@@ -254,7 +283,7 @@ const App: React.FC = () => {
                           Google Cloud Console
                           <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
                         </a>
-                        <button onClick={() => setShowConfig(false)} className="text-xs text-slate-500 hover:text-slate-700 px-2 py-1 rounded hover:bg-slate-100">Done</button>
+                        <button onClick={handleCloseConfig} className="text-xs text-slate-500 hover:text-slate-700 px-2 py-1 rounded hover:bg-slate-100">Done</button>
                      </div>
                   </div>
                  )}
