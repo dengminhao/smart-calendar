@@ -8,6 +8,9 @@ import { LocalEventRecord, ProposedAction, ActionType, CalendarEventData, AIProv
 
 // Storage keys
 const STORAGE_KEY = 'smart_calendar_events_v3';
+// Legacy keys for migration
+const LEGACY_KEYS = ['smart_calendar_events_v2', 'smart_calendar_events'];
+
 const CLIENT_ID_STORAGE_KEY = 'smart_calendar_client_id';
 const AI_CONFIG_KEY = 'smart_calendar_ai_config';
 const MANAGED_CALENDAR_KEY = 'smart_calendar_managed_id';
@@ -44,14 +47,51 @@ const App: React.FC = () => {
 
   const calendarService = useRef(new CalendarService());
 
-  // Load persistence
+  // Load persistence & Migrate Data
   useEffect(() => {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      try {
-        setLocalEvents(JSON.parse(stored));
-      } catch (e) { console.error("Corrupt storage", e); }
-    }
+    const loadAndMigrate = () => {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        try {
+          setLocalEvents(JSON.parse(stored));
+          return;
+        } catch (e) { console.error("Corrupt storage", e); }
+      }
+
+      // If no current data, try migration
+      for (const key of LEGACY_KEYS) {
+        const legacyData = localStorage.getItem(key);
+        if (legacyData) {
+          try {
+            console.log(`Migrating data from ${key}...`);
+            const parsed = JSON.parse(legacyData);
+            // Map legacy fields to new structure
+            const migrated: LocalEventRecord[] = parsed.map((e: any) => ({
+              summary: e.summary,
+              description: e.description,
+              location: e.location,
+              startTime: e.startTime,
+              endTime: e.endTime,
+              localId: e.localId || crypto.randomUUID(),
+              gcalId: e.gcalId || `manual-legacy-${Date.now()}`,
+              lastUpdated: e.lastUpdated || new Date().toISOString(),
+              originalText: e.originalText || "(Restored from older version)",
+              synced: e.synced !== undefined ? e.synced : true, // Assume old ones were synced
+              error: undefined
+            }));
+            
+            setLocalEvents(migrated);
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+            console.log(`Successfully migrated ${migrated.length} events.`);
+            return; // Stop after first successful migration
+          } catch (e) {
+            console.error(`Migration failed for ${key}`, e);
+          }
+        }
+      }
+    };
+
+    loadAndMigrate();
     
     // Restore manual AI configs
     const storedAiConfig = localStorage.getItem(AI_CONFIG_KEY);
@@ -264,7 +304,7 @@ const App: React.FC = () => {
   };
 
   const performSync = async (type: ActionType, gcalId: string, data: CalendarEventData, targetRecord: LocalEventRecord | null | undefined): Promise<string> => {
-      const isManual = gcalId.startsWith('manual-link-');
+      const isManual = gcalId.startsWith('manual-link-') || gcalId.startsWith('manual-legacy-');
       
       if (type === ActionType.CREATE || (type === ActionType.UPDATE && isManual)) {
          const resp = await calendarService.current.createEvent(managedCalendarId, data);
