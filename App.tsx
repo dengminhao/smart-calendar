@@ -381,14 +381,23 @@ const App: React.FC = () => {
     try {
       const now = new Date();
       const min = new Date(now); min.setDate(now.getDate() - 7);
-      const max = new Date(now); max.setDate(now.getDate() + 30);
+      const max = new Date(now); max.setDate(now.getDate() + 60); // Changed range to 60 days
       
       const events = await calendarService.current.listEvents(managedCalendarId, min.toISOString(), max.toISOString());
       
+      // Determine if we are syncing from the primary calendar
+      const currentCal = calendars.find(c => c.id === managedCalendarId);
+      const isPrimary = currentCal?.primary || managedCalendarId === 'primary';
+
       setLocalEvents(prev => {
         const next = [...prev];
         let addedCount = 0;
         events.forEach((e: any) => {
+           // Skip recurring events only if syncing from PRIMARY calendar
+           if (isPrimary && e.recurringEventId) {
+             return; 
+           }
+
            // Basic dedup by Google ID
            if (!next.find(l => l.gcalId === e.id)) {
              next.push({
@@ -623,7 +632,7 @@ const App: React.FC = () => {
                      <button 
                        onClick={handleSyncFromCloud} 
                        disabled={isSyncing}
-                       title="Sync from Google Calendar (Last 7d - Next 30d)"
+                       title="Sync from Google Calendar (Last 7d - Next 60d)"
                        className="p-1.5 text-slate-400 hover:text-sky-600 hover:bg-sky-50 rounded transition-colors disabled:opacity-30"
                      >
                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
