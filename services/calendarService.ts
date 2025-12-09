@@ -6,7 +6,7 @@ declare global {
   }
 }
 
-const SCOPES = 'https://www.googleapis.com/auth/calendar.events';
+const SCOPES = 'https://www.googleapis.com/auth/calendar'; // Updated scope to allow managing calendars
 
 export class CalendarService {
   private tokenClient: any;
@@ -69,12 +69,6 @@ export class CalendarService {
 
   // --- Helpers ---
 
-  /**
-   * Google Calendar API requires:
-   * - 'date' field for all-day events (YYYY-MM-DD)
-   * - 'dateTime' field for timed events (ISO)
-   * They cannot be mixed.
-   */
   private formatTime(timeStr: string) {
     const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(timeStr);
     
@@ -88,11 +82,44 @@ export class CalendarService {
     };
   }
 
-  // --- API Methods (Authenticated via fetch) ---
-
-  public async listEvents(timeMin: string, timeMax: string): Promise<any[]> {
+  private async fetchWithAuth(url: string, options: RequestInit = {}) {
     if (!this.accessToken) throw new Error("Not authenticated");
+    
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${this.accessToken}`,
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
+    });
 
+    if (!response.ok) {
+      if (response.status === 404) throw new Error('404 Not Found');
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error?.message || `API Error: ${response.statusText}`);
+    }
+    
+    return response.json();
+  }
+
+  // --- Calendar Management ---
+
+  public async listCalendars(): Promise<any[]> {
+    const data = await this.fetchWithAuth('https://www.googleapis.com/calendar/v3/users/me/calendarList');
+    return data.items || [];
+  }
+
+  public async createSecondaryCalendar(summary: string): Promise<any> {
+    return this.fetchWithAuth('https://www.googleapis.com/calendar/v3/calendars', {
+      method: 'POST',
+      body: JSON.stringify({ summary })
+    });
+  }
+
+  // --- Event Operations ---
+
+  public async listEvents(calendarId: string = 'primary', timeMin: string, timeMax: string): Promise<any[]> {
     const params = new URLSearchParams({
       timeMin: timeMin,
       timeMax: timeMax,
@@ -100,25 +127,11 @@ export class CalendarService {
       orderBy: 'startTime',
     });
 
-    const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events?${params.toString()}`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${this.accessToken}`,
-      },
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.error?.message || 'Failed to list events');
-    }
-
-    const data = await response.json();
+    const data = await this.fetchWithAuth(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${params.toString()}`);
     return data.items || [];
   }
 
-  public async createEvent(event: any): Promise<any> {
-    if (!this.accessToken) throw new Error("Not authenticated");
-    
+  public async createEvent(calendarId: string = 'primary', event: any): Promise<any> {
     const resource = {
       summary: event.summary,
       location: event.location,
@@ -127,26 +140,13 @@ export class CalendarService {
       end: this.formatTime(event.endTime),
     };
 
-    const response = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+    return this.fetchWithAuth(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${this.accessToken}`,
-        'Content-Type': 'application/json',
-      },
       body: JSON.stringify(resource)
     });
-
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.error?.message || 'Failed to create event');
-    }
-    
-    return await response.json();
   }
 
-  public async updateEvent(eventId: string, event: any): Promise<any> {
-    if (!this.accessToken) throw new Error("Not authenticated");
-
+  public async updateEvent(calendarId: string = 'primary', eventId: string, event: any): Promise<any> {
      const resource: any = {
        summary: event.summary,
        description: event.description,
@@ -156,24 +156,21 @@ export class CalendarService {
      if (event.startTime) resource.start = this.formatTime(event.startTime);
      if (event.endTime) resource.end = this.formatTime(event.endTime);
 
-     const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`, {
+     return this.fetchWithAuth(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`, {
        method: 'PATCH',
-       headers: {
-         'Authorization': `Bearer ${this.accessToken}`,
-         'Content-Type': 'application/json',
-       },
        body: JSON.stringify(resource)
      });
+  }
 
-     if (!response.ok) {
-       if (response.status === 404) {
-         throw new Error('404 Not Found');
-       }
-       const errorData = await response.json();
-       throw new Error(errorData.error?.message || 'Failed to update event');
-     }
-
-     return await response.json();
+  public async moveEvent(calendarId: string, eventId: string, destinationCalendarId: string): Promise<any> {
+    const params = new URLSearchParams({
+      destination: destinationCalendarId
+    });
+    
+    return this.fetchWithAuth(
+      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}/move?${params.toString()}`,
+      { method: 'POST' }
+    );
   }
 
   // --- Utility Methods (No Auth Required) ---

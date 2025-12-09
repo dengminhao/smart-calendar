@@ -1,15 +1,16 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import { CalendarService } from './services/calendarService';
 import { analyzeMessage, fixActionWithAI } from './services/aiService';
 import { ActionPreview } from './components/ActionPreview';
 import { HistoryCard } from './components/HistoryCard';
-import { LocalEventRecord, ProposedAction, ActionType, CalendarEventData, AIProvider } from './types';
+import { LocalEventRecord, ProposedAction, ActionType, CalendarEventData, AIProvider, GoogleCalendar } from './types';
 
 // Storage keys
-const STORAGE_KEY = 'smart_calendar_events_v2';
+const STORAGE_KEY = 'smart_calendar_events_v3';
 const CLIENT_ID_STORAGE_KEY = 'smart_calendar_client_id';
-
 const AI_CONFIG_KEY = 'smart_calendar_ai_config';
+const MANAGED_CALENDAR_KEY = 'smart_calendar_managed_id';
 
 const App: React.FC = () => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -21,6 +22,10 @@ const App: React.FC = () => {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [autoTrust, setAutoTrust] = useState(false);
   
+  // Calendar Management State
+  const [calendars, setCalendars] = useState<GoogleCalendar[]>([]);
+  const [managedCalendarId, setManagedCalendarId] = useState(() => localStorage.getItem(MANAGED_CALENDAR_KEY) || 'primary');
+  
   // --- Configuration State ---
   const [clientId, setClientId] = useState(() => {
     return process.env.GOOGLE_CLIENT_ID || localStorage.getItem(CLIENT_ID_STORAGE_KEY) || '';
@@ -28,12 +33,8 @@ const App: React.FC = () => {
 
   // AI Provider Config
   const [aiProvider, setAiProvider] = useState<AIProvider>(() => (process.env.AI_PROVIDER as AIProvider) || 'GEMINI');
-  
-  // Gemini Config
-  const [geminiApiKey, setGeminiApiKey] = useState(() => process.env.API_KEY || ''); // Often auto-injected
+  const [geminiApiKey, setGeminiApiKey] = useState(() => process.env.API_KEY || ''); 
   const [geminiBaseUrl, setGeminiBaseUrl] = useState(() => process.env.GEMINI_BASE_URL || '');
-  
-  // OpenAI Config
   const [openaiApiKey, setOpenaiApiKey] = useState(() => process.env.OPENAI_API_KEY || '');
   const [openaiBaseUrl, setOpenaiBaseUrl] = useState(() => process.env.OPENAI_BASE_URL || '');
   const [openaiModel, setOpenaiModel] = useState(() => process.env.OPENAI_MODEL || 'gpt-4o');
@@ -52,7 +53,7 @@ const App: React.FC = () => {
       } catch (e) { console.error("Corrupt storage", e); }
     }
     
-    // Restore manual AI configs if saved
+    // Restore manual AI configs
     const storedAiConfig = localStorage.getItem(AI_CONFIG_KEY);
     if (storedAiConfig) {
       const parsed = JSON.parse(storedAiConfig);
@@ -77,19 +78,15 @@ const App: React.FC = () => {
     }
   }, [clientId]);
 
+  // Persist Managed Calendar ID
+  useEffect(() => {
+    localStorage.setItem(MANAGED_CALENDAR_KEY, managedCalendarId);
+  }, [managedCalendarId]);
+
   const handleSaveConfig = () => {
     if (clientId) localStorage.setItem(CLIENT_ID_STORAGE_KEY, clientId);
-    
-    // Save AI configs
-    const configToSave = {
-      provider: aiProvider,
-      geminiBaseUrl,
-      openaiApiKey,
-      openaiBaseUrl,
-      openaiModel
-    };
+    const configToSave = { provider: aiProvider, geminiBaseUrl, openaiApiKey, openaiBaseUrl, openaiModel };
     localStorage.setItem(AI_CONFIG_KEY, JSON.stringify(configToSave));
-    
     setShowConfig(false);
   };
 
@@ -105,27 +102,40 @@ const App: React.FC = () => {
       await calendarService.current.requestAuth();
       setIsAuthenticated(true);
       setShowConfig(false);
+      
+      // Load calendars after auth
+      loadCalendars();
     } catch (err: any) {
       console.error(err);
       setErrorMsg("Sign-in failed. Check Client ID or open in new window.");
     }
   };
 
+  const loadCalendars = async () => {
+    try {
+      const list = await calendarService.current.listCalendars();
+      setCalendars(list);
+    } catch (e) { console.error("Failed to load calendars", e); }
+  };
+
+  const handleCreateSmartCalendar = async () => {
+    try {
+      setIsSyncing(true);
+      const newCal = await calendarService.current.createSecondaryCalendar("Smart AI Sync");
+      await loadCalendars();
+      setManagedCalendarId(newCal.id);
+    } catch (e: any) {
+      setErrorMsg(`Failed to create calendar: ${e.message}`);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   const getAiConfig = () => {
     if (aiProvider === 'OPENAI') {
-      return {
-        provider: 'OPENAI' as AIProvider,
-        apiKey: openaiApiKey,
-        baseUrl: openaiBaseUrl || undefined,
-        model: openaiModel
-      };
+      return { provider: 'OPENAI' as AIProvider, apiKey: openaiApiKey, baseUrl: openaiBaseUrl || undefined, model: openaiModel };
     } else {
-      return {
-        provider: 'GEMINI' as AIProvider,
-        apiKey: geminiApiKey, // Usually pre-filled by env
-        baseUrl: geminiBaseUrl || undefined,
-        model: 'gemini-2.5-flash'
-      };
+      return { provider: 'GEMINI' as AIProvider, apiKey: geminiApiKey, baseUrl: geminiBaseUrl || undefined, model: 'gemini-2.5-flash' };
     }
   };
 
@@ -139,7 +149,45 @@ const App: React.FC = () => {
       const config = getAiConfig();
       const result = await analyzeMessage(inputText, localEvents, config);
       
-      const actions = result.actions;
+      let actions = result.actions;
+
+      // --- DUPLICATE DETECTION / MOVE LOGIC ---
+      if (isAuthenticated) {
+        actions = await Promise.all(actions.map(async (action) => {
+          if (action.type === ActionType.CREATE && action.eventData) {
+            try {
+              // Check primary calendar for conflicts around the same time
+              const start = new Date(action.eventData.startTime);
+              const min = new Date(start); min.setHours(start.getHours() - 2);
+              const max = new Date(start); max.setHours(start.getHours() + 2);
+              
+              // Only check PRIMARY calendar for duplicates to move
+              const events = await calendarService.current.listEvents('primary', min.toISOString(), max.toISOString());
+              
+              // Simple fuzzy match: check if time overlaps AND summary contains partial words
+              const match = events.find((e: any) => {
+                const sameTime = Math.abs(new Date(e.start.dateTime || e.start.date).getTime() - start.getTime()) < 3600000; // within 1 hr
+                // Check if summary is similar? (User says: "Same events... move to our managed calendar")
+                // Let's assume strict time correlation implies it might be the same event user is talking about
+                return sameTime; 
+              });
+
+              if (match) {
+                 return {
+                   ...action,
+                   type: ActionType.MOVE,
+                   sourceCalendarId: 'primary',
+                   sourceEventId: match.id,
+                   reasoning: action.reasoning + ` (Found similar event "${match.summary}" in Primary calendar. Suggesting move.)`,
+                   eventData: { ...action.eventData, summary: match.summary } // Use existing title? or AI title? User likely wants to manage it, so let's keep AI title or match title.
+                 };
+              }
+            } catch (e) { console.warn("Duplicate check failed", e); }
+          }
+          return action;
+        }));
+      }
+      
       setProposedActions(actions);
 
       // Auto-Trust Execution
@@ -147,7 +195,6 @@ const App: React.FC = () => {
         const highConfidenceActions = actions.filter(
           a => a.confidenceScore > 0.85 && (a.type === ActionType.CREATE || a.type === ActionType.UPDATE)
         );
-        
         if (highConfidenceActions.length > 0) {
           for (const action of highConfidenceActions) {
             await handleExecuteAction(action, actions.indexOf(action), true);
@@ -172,10 +219,7 @@ const App: React.FC = () => {
       ? { ...targetRecord, ...action.eventData } 
       : action.eventData;
 
-    if (!mergedEventData) {
-      setIsSyncing(false);
-      return;
-    }
+    if (!mergedEventData) { setIsSyncing(false); return; }
 
     let finalGCalId = targetRecord?.gcalId || ('manual-link-' + Date.now());
     let synced = false;
@@ -183,8 +227,16 @@ const App: React.FC = () => {
 
     if (isAuthenticated && calendarService.current.isAuthenticated()) {
        try {
-          finalGCalId = await performSync(action.type, finalGCalId, mergedEventData, targetRecord);
-          synced = true;
+          if (action.type === ActionType.MOVE && action.sourceCalendarId && action.sourceEventId) {
+             const result = await calendarService.current.moveEvent(action.sourceCalendarId, action.sourceEventId, managedCalendarId);
+             finalGCalId = result.id;
+             // Also optionally update the metadata if AI changed title/time
+             await calendarService.current.updateEvent(managedCalendarId, finalGCalId, mergedEventData);
+             synced = true;
+          } else {
+             finalGCalId = await performSync(action.type, finalGCalId, mergedEventData, targetRecord);
+             synced = true;
+          }
        } catch (err: any) {
          console.warn("Sync failed, trying AI Fix:", err.message);
          try {
@@ -200,7 +252,9 @@ const App: React.FC = () => {
        }
     }
 
-    updateLocalState(action.type, mergedEventData, finalGCalId, synced, syncError, targetRecord?.localId);
+    // Treat MOVE as CREATE in local history
+    const actionTypeForHistory = action.type === ActionType.MOVE ? ActionType.CREATE : action.type;
+    updateLocalState(actionTypeForHistory, mergedEventData, finalGCalId, synced, syncError, targetRecord?.localId);
     
     if (!isAuto) {
       setProposedActions(prev => prev.filter((_, i) => i !== index));
@@ -213,24 +267,25 @@ const App: React.FC = () => {
       const isManual = gcalId.startsWith('manual-link-');
       
       if (type === ActionType.CREATE || (type === ActionType.UPDATE && isManual)) {
-         const resp = await calendarService.current.createEvent(data);
+         const resp = await calendarService.current.createEvent(managedCalendarId, data);
          return resp.id;
       } else {
          try {
-           await calendarService.current.updateEvent(gcalId, data);
+           await calendarService.current.updateEvent(managedCalendarId, gcalId, data);
            return gcalId;
          } catch (e: any) {
            if (e.message.includes('404')) {
+             // Recovery logic: search in managed calendar
              const searchDate = new Date(targetRecord?.startTime || data.startTime);
              const timeMin = new Date(searchDate); timeMin.setHours(0,0,0,0);
              const timeMax = new Date(searchDate); timeMax.setHours(23,59,59,999);
-             const dayEvents = await calendarService.current.listEvents(timeMin.toISOString(), timeMax.toISOString());
+             const dayEvents = await calendarService.current.listEvents(managedCalendarId, timeMin.toISOString(), timeMax.toISOString());
              const match = dayEvents.find((e: any) => e.summary === (targetRecord?.summary || data.summary));
              if (match) {
-               await calendarService.current.updateEvent(match.id, data);
+               await calendarService.current.updateEvent(managedCalendarId, match.id, data);
                return match.id;
              } else {
-               const resp = await calendarService.current.createEvent(data);
+               const resp = await calendarService.current.createEvent(managedCalendarId, data);
                return resp.id;
              }
            }
@@ -279,6 +334,54 @@ const App: React.FC = () => {
     }
   };
 
+  // Sync from Cloud to Local
+  const handleSyncFromCloud = async () => {
+    if (!isAuthenticated) return;
+    setIsSyncing(true);
+    try {
+      const now = new Date();
+      const min = new Date(now); min.setDate(now.getDate() - 7);
+      const max = new Date(now); max.setDate(now.getDate() + 30);
+      
+      const events = await calendarService.current.listEvents(managedCalendarId, min.toISOString(), max.toISOString());
+      
+      setLocalEvents(prev => {
+        const next = [...prev];
+        let addedCount = 0;
+        events.forEach((e: any) => {
+           // Basic dedup by Google ID
+           if (!next.find(l => l.gcalId === e.id)) {
+             next.push({
+               summary: e.summary,
+               description: e.description,
+               location: e.location,
+               startTime: e.start.dateTime || e.start.date,
+               endTime: e.end.dateTime || e.end.date,
+               localId: crypto.randomUUID(),
+               gcalId: e.id,
+               lastUpdated: new Date().toISOString(),
+               synced: true
+             });
+             addedCount++;
+           }
+        });
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+        if (addedCount > 0) alert(`Imported ${addedCount} events from Google Calendar.`);
+        else alert("Local records are up to date.");
+        return next;
+      });
+    } catch (e: any) {
+      setErrorMsg("Failed to sync from cloud: " + e.message);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  const getManagedCalendarName = () => {
+    const cal = calendars.find(c => c.id === managedCalendarId);
+    return cal ? cal.summary : (managedCalendarId === 'primary' ? 'Primary' : 'Unknown');
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 p-4 md:p-8 font-sans">
       <div className="max-w-4xl mx-auto">
@@ -294,20 +397,13 @@ const App: React.FC = () => {
           
           <div className="flex flex-col items-end gap-2 w-full md:w-auto relative">
             <div className="flex items-center gap-2">
-              <button 
-                onClick={() => setShowConfig(!showConfig)}
-                className="text-xs text-slate-400 hover:text-sky-600 underline"
-              >
+              <button onClick={() => setShowConfig(!showConfig)} className="text-xs text-slate-400 hover:text-sky-600 underline">
                 {showConfig ? 'Close Settings' : 'Settings'}
               </button>
 
               {!isAuthenticated ? (
-                <button
-                  onClick={handleAuth}
-                  className="flex items-center gap-2 bg-white text-slate-700 border border-slate-200 px-4 py-2 rounded-full font-semibold hover:bg-slate-50 transition-all text-sm"
-                >
-                  <svg className="w-4 h-4" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4" /><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853" /><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05" /><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335" /></svg>
-                  Connect
+                <button onClick={handleAuth} className="flex items-center gap-2 bg-white text-slate-700 border border-slate-200 px-4 py-2 rounded-full font-semibold hover:bg-slate-50 transition-all text-sm">
+                  Connect Google
                 </button>
               ) : (
                  <div className="flex items-center gap-3">
@@ -319,27 +415,61 @@ const App: React.FC = () => {
                      </div>
                      <span className="text-xs font-medium text-slate-500 group-hover:text-sky-600">Auto-Sync</span>
                    </label>
-                  <span className="text-xs text-emerald-600 bg-emerald-50 px-2 py-1 rounded border border-emerald-100">Connected</span>
+                   
+                   {/* Calendar Selection Badge */}
+                   <div className="text-xs border border-indigo-100 bg-indigo-50 text-indigo-700 px-2 py-1 rounded max-w-[150px] truncate" title={`Managing: ${getManagedCalendarName()}`}>
+                      To: <strong>{getManagedCalendarName()}</strong>
+                   </div>
+                   
+                   <span className="text-xs text-emerald-600 bg-emerald-50 px-2 py-1 rounded border border-emerald-100">Connected</span>
                 </div>
               )}
             </div>
 
             {/* Config Panel */}
             {showConfig && (
-              <div className="absolute top-12 right-0 w-80 bg-white p-5 rounded-xl border border-slate-200 shadow-xl z-50 animate-fade-in text-sm">
+              <div className="absolute top-12 right-0 w-96 bg-white p-5 rounded-xl border border-slate-200 shadow-xl z-50 animate-fade-in text-sm overflow-y-auto max-h-[80vh]">
                  <h3 className="font-bold text-slate-700 mb-3">Settings</h3>
                  
-                 <div className="mb-4">
-                   <label className="block text-xs font-semibold text-slate-500 mb-1">Google Client ID</label>
-                   <input 
-                     type="text" 
-                     value={clientId}
-                     onChange={(e) => setClientId(e.target.value)}
-                     className="w-full border border-slate-300 rounded px-2 py-1.5 focus:ring-2 focus:ring-sky-500 focus:outline-none"
-                     placeholder="OAuth 2.0 Client ID"
-                   />
+                 {/* Google Calendar Settings */}
+                 <div className="mb-4 bg-slate-50 p-3 rounded-lg border border-slate-100">
+                    <h4 className="font-semibold text-slate-600 text-xs mb-2 uppercase tracking-wide">Target Calendar</h4>
+                    
+                    {isAuthenticated ? (
+                      <div className="space-y-2">
+                        <select 
+                          value={managedCalendarId} 
+                          onChange={(e) => setManagedCalendarId(e.target.value)}
+                          className="w-full text-xs border border-slate-300 rounded p-2"
+                        >
+                          {calendars.map(c => (
+                            <option key={c.id} value={c.id}>{c.summary}{c.primary ? ' (Primary)' : ''}</option>
+                          ))}
+                        </select>
+                        <button 
+                          onClick={handleCreateSmartCalendar}
+                          className="w-full text-xs bg-indigo-100 text-indigo-700 py-1.5 rounded hover:bg-indigo-200 transition-colors"
+                        >
+                          + Create "Smart AI Sync" Calendar
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="text-xs text-slate-400 italic">Sign in to select a specific calendar.</div>
+                    )}
+                    
+                    <div className="mt-3">
+                       <label className="block text-xs font-semibold text-slate-500 mb-1">Google Client ID</label>
+                       <input 
+                         type="text" 
+                         value={clientId}
+                         onChange={(e) => setClientId(e.target.value)}
+                         className="w-full border border-slate-300 rounded px-2 py-1.5"
+                         placeholder="OAuth 2.0 Client ID"
+                       />
+                    </div>
                  </div>
 
+                 {/* AI Settings */}
                  <div className="border-t border-slate-100 my-3 pt-3">
                    <label className="block text-xs font-semibold text-slate-500 mb-2">AI Provider</label>
                    <div className="flex bg-slate-100 p-1 rounded-lg mb-3">
@@ -361,47 +491,22 @@ const App: React.FC = () => {
                       <div className="space-y-2">
                         <div>
                           <label className="block text-[10px] text-slate-400 mb-1">Base URL (Optional)</label>
-                          <input 
-                            type="text" 
-                            value={geminiBaseUrl}
-                            onChange={(e) => setGeminiBaseUrl(e.target.value)}
-                            placeholder="https://generativelanguage.googleapis.com"
-                            className="w-full border border-slate-300 rounded px-2 py-1"
-                          />
+                          <input type="text" value={geminiBaseUrl} onChange={(e) => setGeminiBaseUrl(e.target.value)} placeholder="https://generativelanguage.googleapis.com" className="w-full border border-slate-300 rounded px-2 py-1"/>
                         </div>
-                        <p className="text-[10px] text-slate-400">API Key is usually handled via environment variables.</p>
                       </div>
                    ) : (
                       <div className="space-y-2">
                         <div>
                           <label className="block text-[10px] text-slate-400 mb-1">OpenAI API Key</label>
-                          <input 
-                            type="password" 
-                            value={openaiApiKey}
-                            onChange={(e) => setOpenaiApiKey(e.target.value)}
-                            className="w-full border border-slate-300 rounded px-2 py-1"
-                            placeholder="sk-..."
-                          />
+                          <input type="password" value={openaiApiKey} onChange={(e) => setOpenaiApiKey(e.target.value)} className="w-full border border-slate-300 rounded px-2 py-1"/>
                         </div>
                         <div>
                           <label className="block text-[10px] text-slate-400 mb-1">Model Name</label>
-                          <input 
-                            type="text" 
-                            value={openaiModel}
-                            onChange={(e) => setOpenaiModel(e.target.value)}
-                            className="w-full border border-slate-300 rounded px-2 py-1"
-                            placeholder="gpt-4o"
-                          />
+                          <input type="text" value={openaiModel} onChange={(e) => setOpenaiModel(e.target.value)} className="w-full border border-slate-300 rounded px-2 py-1"/>
                         </div>
                         <div>
                           <label className="block text-[10px] text-slate-400 mb-1">Base URL (Optional)</label>
-                          <input 
-                            type="text" 
-                            value={openaiBaseUrl}
-                            onChange={(e) => setOpenaiBaseUrl(e.target.value)}
-                            className="w-full border border-slate-300 rounded px-2 py-1"
-                            placeholder="https://api.openai.com"
-                          />
+                          <input type="text" value={openaiBaseUrl} onChange={(e) => setOpenaiBaseUrl(e.target.value)} className="w-full border border-slate-300 rounded px-2 py-1"/>
                         </div>
                       </div>
                    )}
@@ -463,6 +568,7 @@ const App: React.FC = () => {
                     isAuthenticated={isAuthenticated}
                     onConfirm={() => handleExecuteAction(action, idx)}
                     onCancel={() => setProposedActions(prev => prev.filter((_, i) => i !== idx))}
+                    targetCalendarName={getManagedCalendarName()}
                   />
                 ))}
               </div>
@@ -472,7 +578,19 @@ const App: React.FC = () => {
           <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 h-fit sticky top-4">
              <div className="flex justify-between items-center mb-4">
                <h3 className="font-semibold text-slate-700">Managed Events</h3>
-               <span className="text-xs bg-slate-100 px-2 py-1 rounded text-slate-500">{localEvents.length}</span>
+               <div className="flex items-center gap-2">
+                  {isAuthenticated && (
+                     <button 
+                       onClick={handleSyncFromCloud} 
+                       disabled={isSyncing}
+                       title="Sync from Google Calendar (Last 7d - Next 30d)"
+                       className="p-1.5 text-slate-400 hover:text-sky-600 hover:bg-sky-50 rounded transition-colors disabled:opacity-30"
+                     >
+                       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                     </button>
+                  )}
+                  <span className="text-xs bg-slate-100 px-2 py-1 rounded text-slate-500">{localEvents.length}</span>
+               </div>
              </div>
              <div className="space-y-2 max-h-[500px] overflow-y-auto">
                {[...localEvents].sort((a, b) => new Date(b.lastUpdated).getTime() - new Date(a.lastUpdated).getTime()).map(e => (

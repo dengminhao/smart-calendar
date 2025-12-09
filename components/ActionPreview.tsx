@@ -9,10 +9,20 @@ interface Props {
   onCancel: () => void;
   isProcessing: boolean;
   isAuthenticated: boolean;
+  targetCalendarName?: string;
 }
 
-export const ActionPreview: React.FC<Props> = ({ action, onConfirm, onCancel, isProcessing, isAuthenticated }) => {
+export const ActionPreview: React.FC<Props> = ({ 
+  action, 
+  onConfirm, 
+  onCancel, 
+  isProcessing, 
+  isAuthenticated,
+  targetCalendarName = 'Calendar' 
+}) => {
   const isCreate = action.type === ActionType.CREATE;
+  const isMove = action.type === ActionType.MOVE;
+  
   const calendarService = new CalendarService(); // Helper for link generation
   
   if (action.type === ActionType.IGNORE) {
@@ -26,14 +36,26 @@ export const ActionPreview: React.FC<Props> = ({ action, onConfirm, onCancel, is
   }
 
   const data = action.eventData;
-
-  // Generate link for unauthenticated users
   const webLink = (!isAuthenticated && data) ? calendarService.generateCalendarUrl(data) : null;
 
+  let borderColor = 'border-amber-500';
+  let bgColor = 'bg-amber-50';
+  let badgeColor = 'bg-amber-100 text-amber-800';
+
+  if (isCreate) {
+    borderColor = 'border-emerald-500';
+    bgColor = 'bg-emerald-50';
+    badgeColor = 'bg-emerald-100 text-emerald-800';
+  } else if (isMove) {
+    borderColor = 'border-indigo-500';
+    bgColor = 'bg-indigo-50';
+    badgeColor = 'bg-indigo-100 text-indigo-800';
+  }
+
   return (
-    <div className={`rounded-xl p-5 mb-4 border-l-4 shadow-md ${isCreate ? 'bg-emerald-50 border-emerald-500' : 'bg-amber-50 border-amber-500'}`}>
+    <div className={`rounded-xl p-5 mb-4 border-l-4 shadow-md ${bgColor} ${borderColor}`}>
       <div className="flex justify-between items-center mb-3">
-        <span className={`text-xs font-bold px-2 py-1 rounded uppercase tracking-wider ${isCreate ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
+        <span className={`text-xs font-bold px-2 py-1 rounded uppercase tracking-wider ${badgeColor}`}>
           {action.type}
         </span>
         <span className="text-xs text-slate-500">Confidence: {(action.confidenceScore * 100).toFixed(0)}%</span>
@@ -42,6 +64,12 @@ export const ActionPreview: React.FC<Props> = ({ action, onConfirm, onCancel, is
       <div className="space-y-2 mb-4">
         <h3 className="text-xl font-bold text-slate-800">{data?.summary || 'Untitled Event'}</h3>
         
+        {isMove && (
+          <div className="bg-indigo-100/50 p-2 rounded text-xs text-indigo-800 font-medium mb-2 border border-indigo-200">
+             Found a similar event in your Primary calendar. Would you like to move it to <strong>{targetCalendarName}</strong>?
+          </div>
+        )}
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
           <div className="text-slate-600">
              <span className="block text-slate-400 text-xs mb-1">Start Time</span>
@@ -75,25 +103,25 @@ export const ActionPreview: React.FC<Props> = ({ action, onConfirm, onCancel, is
           <button
             onClick={onConfirm}
             disabled={isProcessing}
-            className={`flex-1 py-2 px-4 rounded-lg font-medium transition-colors ${
-              isCreate 
-                ? 'bg-emerald-600 hover:bg-emerald-500 text-white' 
-                : 'bg-amber-600 hover:bg-amber-500 text-white'
-            } disabled:opacity-50 disabled:cursor-not-allowed`}
+            className={`flex-1 py-2 px-4 rounded-lg font-medium transition-colors text-white disabled:opacity-50 disabled:cursor-not-allowed ${
+              isCreate ? 'bg-emerald-600 hover:bg-emerald-500' :
+              isMove ? 'bg-indigo-600 hover:bg-indigo-500' :
+              'bg-amber-600 hover:bg-amber-500'
+            }`}
           >
-            {isProcessing ? 'Syncing...' : (isCreate ? 'Add to Calendar' : 'Update Event')}
+            {isProcessing ? 'Syncing...' : (
+              isCreate ? `Add to ${targetCalendarName}` :
+              isMove ? `Move to ${targetCalendarName}` :
+              'Update Event'
+            )}
           </button>
         ) : (
            <a
             href={webLink || '#'}
             target="_blank"
             rel="noopener noreferrer"
-            onClick={onConfirm} // We still trigger onConfirm to save to local history
-            className={`flex-1 py-2 px-4 rounded-lg font-medium text-center transition-colors flex items-center justify-center gap-2 ${
-              isCreate 
-                ? 'bg-emerald-600 hover:bg-emerald-500 text-white' 
-                : 'bg-amber-600 hover:bg-amber-500 text-white'
-            }`}
+            onClick={onConfirm}
+            className="flex-1 py-2 px-4 rounded-lg font-medium text-center transition-colors flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white"
           >
             <span>Open in Google Calendar</span>
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">

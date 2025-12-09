@@ -1,3 +1,4 @@
+
 export interface CalendarEventData {
   summary: string;
   description?: string;
@@ -19,6 +20,7 @@ export interface LocalEventRecord extends CalendarEventData {
 export enum ActionType {
   CREATE = 'CREATE',
   UPDATE = 'UPDATE',
+  MOVE = 'MOVE', // New: Move from another calendar to managed calendar
   IGNORE = 'IGNORE',
 }
 
@@ -28,6 +30,10 @@ export interface ProposedAction {
   reasoning: string;
   eventData?: CalendarEventData;
   targetLocalId?: string; // If UPDATE, which local ID are we modifying?
+  
+  // For Move Logic
+  sourceCalendarId?: string;
+  sourceEventId?: string;
 }
 
 // The raw response from Gemini
@@ -42,4 +48,10 @@ export interface AIConfig {
   apiKey: string;
   baseUrl?: string;
   model?: string;
+}
+
+export interface GoogleCalendar {
+  id: string;
+  summary: string;
+  primary?: boolean;
 }
