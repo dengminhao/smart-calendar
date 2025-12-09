@@ -134,57 +134,111 @@ const App: React.FC = () => {
 
   const handleExecuteAction = async (action: ProposedAction, index: number) => {
     setIsSyncing(true);
-    try {
-      let gcalId = 'manual-link-' + Date.now(); // Default for manual mode
+    setErrorMsg(null);
 
-      // If Authenticated, try to use API
+    try {
+      // 1. Identify Target & Prepare Data
+      // If it's an UPDATE, we merge the existing local record with the AI's proposed changes.
+      // This ensures we have a complete event object (Title, Time, etc.) even if AI only sent partial updates.
+      const targetRecord = action.targetLocalId ? localEvents.find(e => e.localId === action.targetLocalId) : null;
+      
+      // Merge: New data overrides old data
+      const mergedEventData = (action.type === ActionType.UPDATE && targetRecord)
+        ? { ...targetRecord, ...action.eventData } 
+        : action.eventData;
+
+      if (!mergedEventData) throw new Error("No event data available.");
+
+      // Default ID (stays this way if we are offline/unauth)
+      let finalGCalId = targetRecord?.gcalId || ('manual-link-' + Date.now());
+
+      // 2. API Interaction (if authenticated)
       if (isAuthenticated && calendarService.current.isAuthenticated()) {
         try {
-          if (action.type === ActionType.CREATE && action.eventData) {
-            const gcalResponse = await calendarService.current.createEvent(action.eventData);
-            gcalId = gcalResponse.id;
-          } else if (action.type === ActionType.UPDATE && action.targetLocalId && action.eventData) {
-             const targetRecord = localEvents.find(e => e.localId === action.targetLocalId);
-             if (targetRecord) {
-               await calendarService.current.updateEvent(targetRecord.gcalId, action.eventData);
-               gcalId = targetRecord.gcalId;
+          const isExistingManualLink = finalGCalId.startsWith('manual-link-');
+
+          if (action.type === ActionType.CREATE) {
+            // Standard Create
+            const resp = await calendarService.current.createEvent(mergedEventData);
+            finalGCalId = resp.id;
+          } 
+          else if (action.type === ActionType.UPDATE) {
+             if (isExistingManualLink) {
+               // Logic A: Upgrading Manual -> Real
+               const resp = await calendarService.current.createEvent(mergedEventData);
+               finalGCalId = resp.id;
+             } else {
+               // Logic B: Standard Update (PATCH)
+               try {
+                  await calendarService.current.updateEvent(finalGCalId, mergedEventData);
+               } catch (updateErr: any) {
+                 // Logic C: Handle 404 (Event not found on Server)
+                 if (updateErr.message.includes('404')) {
+                   console.warn("Event 404'd. Attempting recovery...");
+                   
+                   // Determine the day range of the ORIGINAL event to look for duplicates/matches
+                   const searchDate = new Date(targetRecord?.startTime || mergedEventData.startTime);
+                   const timeMin = new Date(searchDate); timeMin.setHours(0,0,0,0);
+                   const timeMax = new Date(searchDate); timeMax.setHours(23,59,59,999);
+
+                   // Fetch events for that day
+                   const dayEvents = await calendarService.current.listEvents(timeMin.toISOString(), timeMax.toISOString());
+                   
+                   // Try to find a match by Summary (Title)
+                   const match = dayEvents.find((e: any) => e.summary === targetRecord?.summary);
+
+                   if (match) {
+                     // Found it! The ID must have changed or we had the wrong one.
+                     console.log(`Recovered event! Updating ID from ${finalGCalId} to ${match.id}`);
+                     finalGCalId = match.id;
+                     await calendarService.current.updateEvent(finalGCalId, mergedEventData);
+                   } else {
+                     // Not found on that day. It was likely deleted. Re-create it.
+                     console.log("Event not found on server. Re-creating...");
+                     const resp = await calendarService.current.createEvent(mergedEventData);
+                     finalGCalId = resp.id;
+                   }
+                 } else {
+                   // Some other error, rethrow
+                   throw updateErr;
+                 }
+               }
              }
           }
-        } catch (authErr: any) {
-          console.error("API Error", authErr);
-          setErrorMsg("API Error: " + (authErr.result?.error?.message || authErr.message) + ". Event saved locally only.");
-          // Fallback: Continue to save locally even if API failed, or if user just clicked the link
+        } catch (apiErr: any) {
+          console.error("API Sync Failed", apiErr);
+          // Don't block the UI. Show warning but allow local save to proceed.
+          setErrorMsg(`Synced locally, but Google Calendar API failed: ${apiErr.message || 'Unknown error'}`);
         }
       }
 
-      // 2. Update Local State (Always do this, even if using Links, to maintain context)
-      if (action.type === ActionType.CREATE && action.eventData) {
-        const newRecord: LocalEventRecord = {
-          ...action.eventData,
+      // 3. Update Local State (Single Source of Truth)
+      // We update our local list regardless of API success/failure so the user doesn't lose data.
+      let updatedList = [...localEvents];
+
+      if (action.type === ActionType.CREATE) {
+        updatedList.push({
+          ...mergedEventData,
           localId: crypto.randomUUID(),
-          gcalId: gcalId,
+          gcalId: finalGCalId,
           lastUpdated: new Date().toISOString(),
-        };
-
-        const updatedList = [...localEvents, newRecord];
-        setLocalEvents(updatedList);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(updatedList));
-
-      } else if (action.type === ActionType.UPDATE && action.targetLocalId && action.eventData) {
-        const updatedList = localEvents.map(e => {
-          if (e.localId === action.targetLocalId) {
+        } as LocalEventRecord);
+      } else if (action.type === ActionType.UPDATE && targetRecord) {
+        updatedList = updatedList.map(e => {
+          if (e.localId === targetRecord.localId) {
             return {
               ...e,
-              ...action.eventData!,
+              ...mergedEventData,
+              gcalId: finalGCalId, // Update ID (Might have changed in 404 recovery)
               lastUpdated: new Date().toISOString(),
-            };
+            } as LocalEventRecord;
           }
           return e;
         });
-
-        setLocalEvents(updatedList);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(updatedList));
       }
+
+      setLocalEvents(updatedList);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(updatedList));
 
       // Remove executed action from list
       setProposedActions(prev => prev.filter((_, i) => i !== index));

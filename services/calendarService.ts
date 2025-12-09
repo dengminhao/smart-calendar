@@ -72,6 +72,32 @@ export class CalendarService {
 
   // --- API Methods (Authenticated via fetch) ---
 
+  public async listEvents(timeMin: string, timeMax: string): Promise<any[]> {
+    if (!this.accessToken) throw new Error("Not authenticated");
+
+    const params = new URLSearchParams({
+      timeMin: timeMin,
+      timeMax: timeMax,
+      singleEvents: 'true',
+      orderBy: 'startTime',
+    });
+
+    const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events?${params.toString()}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${this.accessToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error?.message || 'Failed to list events');
+    }
+
+    const data = await response.json();
+    return data.items || [];
+  }
+
   public async createEvent(event: any): Promise<any> {
     if (!this.accessToken) throw new Error("Not authenticated");
     
@@ -139,6 +165,10 @@ export class CalendarService {
      });
 
      if (!response.ok) {
+       // We prefer to throw the raw status to handle 404 explicitly
+       if (response.status === 404) {
+         throw new Error('404 Not Found');
+       }
        const errorData = await response.json();
        throw new Error(errorData.error?.message || 'Failed to update event');
      }
