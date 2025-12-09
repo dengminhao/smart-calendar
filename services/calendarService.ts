@@ -50,7 +50,6 @@ export class CalendarService {
         return;
       }
       
-      // Override callback to resolve promise
       this.tokenClient.callback = (resp: any) => {
         if (resp.error) {
           reject(resp);
@@ -60,14 +59,33 @@ export class CalendarService {
         }
       };
 
-      // Always request consent to ensure we get a fresh token if needed
-      // In a prod app, you might check validity first
       this.tokenClient.requestAccessToken({ prompt: '' });
     });
   }
 
   public isAuthenticated(): boolean {
     return !!this.accessToken;
+  }
+
+  // --- Helpers ---
+
+  /**
+   * Google Calendar API requires:
+   * - 'date' field for all-day events (YYYY-MM-DD)
+   * - 'dateTime' field for timed events (ISO)
+   * They cannot be mixed.
+   */
+  private formatTime(timeStr: string) {
+    const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(timeStr);
+    
+    if (isDateOnly) {
+      return { date: timeStr };
+    }
+    
+    return {
+      dateTime: timeStr,
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    };
   }
 
   // --- API Methods (Authenticated via fetch) ---
@@ -105,14 +123,8 @@ export class CalendarService {
       summary: event.summary,
       location: event.location,
       description: event.description,
-      start: {
-        dateTime: event.startTime,
-        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      },
-      end: {
-        dateTime: event.endTime,
-        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      },
+      start: this.formatTime(event.startTime),
+      end: this.formatTime(event.endTime),
     };
 
     const response = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
@@ -138,22 +150,11 @@ export class CalendarService {
      const resource: any = {
        summary: event.summary,
        description: event.description,
+       location: event.location,
      };
 
-     if (event.location) resource.location = event.location;
-     
-     if (event.startTime) {
-       resource.start = {
-         dateTime: event.startTime,
-         timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-       };
-     }
-     if (event.endTime) {
-       resource.end = {
-         dateTime: event.endTime,
-         timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-       };
-     }
+     if (event.startTime) resource.start = this.formatTime(event.startTime);
+     if (event.endTime) resource.end = this.formatTime(event.endTime);
 
      const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`, {
        method: 'PATCH',
@@ -165,7 +166,6 @@ export class CalendarService {
      });
 
      if (!response.ok) {
-       // We prefer to throw the raw status to handle 404 explicitly
        if (response.status === 404) {
          throw new Error('404 Not Found');
        }
@@ -178,17 +178,12 @@ export class CalendarService {
 
   // --- Utility Methods (No Auth Required) ---
 
-  /**
-   * Generates a Google Calendar Web Link (render URL).
-   * Used when the user is not authenticated via OAuth.
-   */
   public generateCalendarUrl(event: any): string {
     const formatTime = (isoString: string) => {
       // Remove punctuation for Google Calendar format: YYYYMMDDTHHMMSSZ
       return isoString.replace(/[-:.]/g, '').slice(0, 15) + 'Z';
     };
 
-    // Convert to UTC for the link to ensure timezone consistency
     const start = new Date(event.startTime).toISOString();
     const end = new Date(event.endTime).toISOString();
     

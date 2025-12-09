@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type } from "@google/genai";
-import { GeminiResponse, LocalEventRecord, ActionType } from "../types";
+import { GeminiResponse, LocalEventRecord, ActionType, CalendarEventData } from "../types";
 
 const SYSTEM_INSTRUCTION = `
 You are a smart calendar assistant. 
@@ -11,15 +11,16 @@ When the user provides a message, you must decide to:
 2. UPDATE: If the message refers to an existing event (e.g., "Change the time for the meeting with Bob").
 3. IGNORE: If the message is irrelevant to scheduling.
 
+CRITICAL TIME & DATE RULES:
+1.  **Format**: Return 'startTime' and 'endTime' as strictly ISO 8601 DateTime strings (YYYY-MM-DDTHH:mm:ss).
+2.  **No UTC 'Z'**: Do NOT append 'Z' to the end. The system assumes local time. If you add 'Z', the time will be shifted wrong.
+3.  **Duration**: If no duration is specified, assume 1 hour.
+4.  **Consistency**: 'startTime' and 'endTime' MUST be the same format. Do not mix simple Date (YYYY-MM-DD) with DateTime. Always prefer DateTime.
+5.  **Relative Dates**: Calculate specific dates based on the "Current Date/Time" provided in the prompt.
+
 Rules for UPDATE:
 - Look for semantic matches (similar titles, same participants) in the existing events list.
-- If the user says "Change the meeting on Friday to 2pm", find the Friday meeting in the list and target it.
 - Return the 'targetLocalId' of the event to update.
-
-Rules for Time:
-- Parse relative dates (e.g., "tomorrow", "next friday") assuming the current date is provided in the prompt.
-- Return ISO 8601 strings for start/end times.
-- If no duration is specified, assume 1 hour.
 `;
 
 export interface GeminiConfig {
@@ -27,27 +28,29 @@ export interface GeminiConfig {
   baseUrl?: string;
 }
 
+const getAIClient = (config?: GeminiConfig) => {
+  const apiKey = config?.apiKey || process.env.API_KEY;
+  if (!apiKey) {
+    throw new Error("Gemini API Key is missing.");
+  }
+  return new GoogleGenAI({ 
+    apiKey: apiKey,
+    baseUrl: config?.baseUrl 
+  });
+};
+
 export const analyzeMessage = async (
   message: string,
   existingEvents: LocalEventRecord[],
   config?: GeminiConfig
 ): Promise<GeminiResponse> => {
   
-  // Use provided key, or fallback to env var
-  const apiKey = config?.apiKey || process.env.API_KEY;
-  if (!apiKey) {
-    throw new Error("Gemini API Key is missing. Please set it in the code or environment.");
-  }
-
-  // Initialize SDK dynamically to support Base URL (Proxy) changes
-  const ai = new GoogleGenAI({ 
-    apiKey: apiKey,
-    baseUrl: config?.baseUrl // Allows routing requests through a proxy
-  });
+  const ai = getAIClient(config);
 
   const now = new Date();
   const contextPrompt = `
-    Current Date/Time: ${now.toISOString()} (${now.toLocaleDateString('en-US', { weekday: 'long' })})
+    Current Date/Time (Local): ${now.toLocaleString()} 
+    ISO Reference: ${now.toISOString()}
     
     User Message: "${message}"
 
@@ -104,4 +107,56 @@ export const analyzeMessage = async (
   }
   
   throw new Error("No response from AI");
+};
+
+/**
+ * Feeds an API error back to Gemini to ask for a corrected JSON payload.
+ */
+export const fixActionWithAI = async (
+  failedEventData: CalendarEventData,
+  errorMessage: string,
+  config?: GeminiConfig
+): Promise<CalendarEventData> => {
+  const ai = getAIClient(config);
+
+  const prompt = `
+    I tried to send this event data to Google Calendar API but it failed.
+    
+    My Data:
+    ${JSON.stringify(failedEventData, null, 2)}
+    
+    The API Error:
+    "${errorMessage}"
+    
+    Please correct the data structure to fix the error. 
+    Often this is due to:
+    1. Mixing Date (YYYY-MM-DD) and DateTime (ISO). Make them both ISO DateTime.
+    2. Invalid Timezone offsets.
+    3. Missing required fields.
+    
+    Return ONLY the corrected JSON object for the event data.
+  `;
+
+  const response = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          summary: { type: Type.STRING },
+          description: { type: Type.STRING },
+          location: { type: Type.STRING },
+          startTime: { type: Type.STRING },
+          endTime: { type: Type.STRING },
+        }
+      }
+    }
+  });
+
+  if (response.text) {
+    return JSON.parse(response.text) as CalendarEventData;
+  }
+  throw new Error("AI could not fix the error.");
 };

@@ -1,13 +1,13 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { CalendarService } from './services/calendarService';
-import { analyzeMessage } from './services/geminiService';
+import { analyzeMessage, fixActionWithAI } from './services/geminiService';
 import { ActionPreview } from './components/ActionPreview';
 import { HistoryCard } from './components/HistoryCard';
-import { LocalEventRecord, ProposedAction, ActionType } from './types';
+import { LocalEventRecord, ProposedAction, ActionType, CalendarEventData } from './types';
 
-// Storage key
-const STORAGE_KEY = 'smart_calendar_events_v1';
+// Storage keys
+const STORAGE_KEY = 'smart_calendar_events_v2';
 const CLIENT_ID_STORAGE_KEY = 'smart_calendar_client_id';
 const BASE_URL_STORAGE_KEY = 'smart_calendar_base_url';
 
@@ -19,13 +19,13 @@ const App: React.FC = () => {
   const [proposedActions, setProposedActions] = useState<ProposedAction[]>([]);
   const [localEvents, setLocalEvents] = useState<LocalEventRecord[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [autoTrust, setAutoTrust] = useState(false);
   
   // Auth & Config state
   const [clientId, setClientId] = useState(() => {
     return process.env.GOOGLE_CLIENT_ID || localStorage.getItem(CLIENT_ID_STORAGE_KEY) || '';
   });
   
-  // Proxy / Base URL state
   const [geminiBaseUrl, setGeminiBaseUrl] = useState(() => {
     return process.env.GEMINI_BASE_URL || localStorage.getItem(BASE_URL_STORAGE_KEY) || '';
   });
@@ -48,7 +48,6 @@ const App: React.FC = () => {
     }
     setCurrentOrigin(window.location.origin);
     
-    // Check if running in an iframe/sandbox which often breaks Google Auth
     try {
       if (window.self !== window.top) {
         setIsSandboxed(true);
@@ -69,7 +68,6 @@ const App: React.FC = () => {
     }
   }, [clientId]);
 
-  // Save configs when closed
   const handleCloseConfig = () => {
     if (clientId) localStorage.setItem(CLIENT_ID_STORAGE_KEY, clientId);
     if (geminiBaseUrl) localStorage.setItem(BASE_URL_STORAGE_KEY, geminiBaseUrl);
@@ -80,35 +78,20 @@ const App: React.FC = () => {
 
   const handleAuth = async () => {
     setErrorMsg(null);
-    
     if (!clientId) {
       setErrorMsg("Please enter a Google Client ID to connect.");
       setShowConfig(true);
       return;
     }
-
-    // Ensure service uses current ID
     try {
-       calendarService.current.initializeGis(clientId);
-       localStorage.setItem(CLIENT_ID_STORAGE_KEY, clientId); 
-    } catch (e) {
-       console.error(e);
-       setErrorMsg("Invalid Client ID format or GIS not ready.");
-       return;
-    }
-
-    try {
+      calendarService.current.initializeGis(clientId);
+      localStorage.setItem(CLIENT_ID_STORAGE_KEY, clientId); 
       await calendarService.current.requestAuth();
       setIsAuthenticated(true);
       setShowConfig(false);
     } catch (err: any) {
       console.error(err);
-      if (err.type === 'token_failed') {
-          setErrorMsg("Authorization failed. Please try again.");
-      } else {
-          // Provide a specific hint for the 400 storagerelay error
-          setErrorMsg("Sign-in failed. If you see a '400' error, try opening this app in a New Window (outside the preview frame) or use Lite Mode.");
-      }
+      setErrorMsg("Sign-in failed. Try opening in a new window or check Client ID.");
     }
   };
 
@@ -119,12 +102,32 @@ const App: React.FC = () => {
     setProposedActions([]);
 
     try {
-      // Pass localEvents as context so AI knows what exists
-      // Pass dynamic config for Base URL (Proxy)
       const result = await analyzeMessage(inputText, localEvents, {
         baseUrl: geminiBaseUrl || undefined
       });
-      setProposedActions(result.actions);
+      
+      const actions = result.actions;
+      setProposedActions(actions);
+
+      // Auto-Trust Execution
+      if (autoTrust && isAuthenticated) {
+        // Filter for high confidence create/updates
+        const highConfidenceActions = actions.filter(
+          a => a.confidenceScore > 0.85 && (a.type === ActionType.CREATE || a.type === ActionType.UPDATE)
+        );
+        
+        if (highConfidenceActions.length > 0) {
+          console.log(`Auto-Trust: Executing ${highConfidenceActions.length} actions automatically.`);
+          // Execute sequentially
+          for (const action of highConfidenceActions) {
+            const index = actions.indexOf(action);
+            await handleExecuteAction(action, index, true); // true = auto mode
+          }
+          // Remove executed actions from view
+          setProposedActions(prev => prev.filter(p => !highConfidenceActions.includes(p)));
+          setInputText('');
+        }
+      }
     } catch (err: any) {
       setErrorMsg(err.message || "Failed to analyze text.");
     } finally {
@@ -132,123 +135,143 @@ const App: React.FC = () => {
     }
   };
 
-  const handleExecuteAction = async (action: ProposedAction, index: number) => {
+  const handleExecuteAction = async (action: ProposedAction, index: number, isAuto = false) => {
     setIsSyncing(true);
     setErrorMsg(null);
 
-    try {
-      // 1. Identify Target & Prepare Data
-      // If it's an UPDATE, we merge the existing local record with the AI's proposed changes.
-      // This ensures we have a complete event object (Title, Time, etc.) even if AI only sent partial updates.
-      const targetRecord = action.targetLocalId ? localEvents.find(e => e.localId === action.targetLocalId) : null;
-      
-      // Merge: New data overrides old data
-      const mergedEventData = (action.type === ActionType.UPDATE && targetRecord)
-        ? { ...targetRecord, ...action.eventData } 
-        : action.eventData;
+    // 1. Identify Target & Merge Data
+    const targetRecord = action.targetLocalId ? localEvents.find(e => e.localId === action.targetLocalId) : null;
+    let mergedEventData = (action.type === ActionType.UPDATE && targetRecord)
+      ? { ...targetRecord, ...action.eventData } 
+      : action.eventData;
 
-      if (!mergedEventData) throw new Error("No event data available.");
+    if (!mergedEventData) {
+      setIsSyncing(false);
+      return;
+    }
 
-      // Default ID (stays this way if we are offline/unauth)
-      let finalGCalId = targetRecord?.gcalId || ('manual-link-' + Date.now());
+    let finalGCalId = targetRecord?.gcalId || ('manual-link-' + Date.now());
+    let synced = false;
+    let syncError: string | undefined = undefined;
 
-      // 2. API Interaction (if authenticated)
-      if (isAuthenticated && calendarService.current.isAuthenticated()) {
-        try {
-          const isExistingManualLink = finalGCalId.startsWith('manual-link-');
+    // 2. Try Sync with Retry Loop
+    if (isAuthenticated && calendarService.current.isAuthenticated()) {
+       try {
+          finalGCalId = await performSync(action.type, finalGCalId, mergedEventData, targetRecord);
+          synced = true;
+       } catch (err: any) {
+         console.warn("First sync attempt failed:", err.message);
+         
+         // --- AI RECOVERY LOOP ---
+         // If invalid data, ask AI to fix it using the error message
+         try {
+           console.log("Attempting AI Fix...");
+           const fixedData = await fixActionWithAI(mergedEventData, err.message, { baseUrl: geminiBaseUrl || undefined });
+           console.log("AI Fixed Data:", fixedData);
+           
+           // Apply fix and retry
+           mergedEventData = { ...mergedEventData, ...fixedData };
+           finalGCalId = await performSync(action.type, finalGCalId, mergedEventData, targetRecord);
+           synced = true;
+           console.log("Recovery successful!");
+         } catch (retryErr: any) {
+           console.error("Recovery failed:", retryErr);
+           synced = false;
+           syncError = retryErr.message;
+           if (!isAuto) setErrorMsg(`Sync Failed: ${retryErr.message}. Saved locally.`);
+         }
+       }
+    }
 
-          if (action.type === ActionType.CREATE) {
-            // Standard Create
-            const resp = await calendarService.current.createEvent(mergedEventData);
-            finalGCalId = resp.id;
-          } 
-          else if (action.type === ActionType.UPDATE) {
-             if (isExistingManualLink) {
-               // Logic A: Upgrading Manual -> Real
-               const resp = await calendarService.current.createEvent(mergedEventData);
-               finalGCalId = resp.id;
-             } else {
-               // Logic B: Standard Update (PATCH)
-               try {
-                  await calendarService.current.updateEvent(finalGCalId, mergedEventData);
-               } catch (updateErr: any) {
-                 // Logic C: Handle 404 (Event not found on Server)
-                 if (updateErr.message.includes('404')) {
-                   console.warn("Event 404'd. Attempting recovery...");
-                   
-                   // Determine the day range of the ORIGINAL event to look for duplicates/matches
-                   const searchDate = new Date(targetRecord?.startTime || mergedEventData.startTime);
-                   const timeMin = new Date(searchDate); timeMin.setHours(0,0,0,0);
-                   const timeMax = new Date(searchDate); timeMax.setHours(23,59,59,999);
-
-                   // Fetch events for that day
-                   const dayEvents = await calendarService.current.listEvents(timeMin.toISOString(), timeMax.toISOString());
-                   
-                   // Try to find a match by Summary (Title)
-                   const match = dayEvents.find((e: any) => e.summary === targetRecord?.summary);
-
-                   if (match) {
-                     // Found it! The ID must have changed or we had the wrong one.
-                     console.log(`Recovered event! Updating ID from ${finalGCalId} to ${match.id}`);
-                     finalGCalId = match.id;
-                     await calendarService.current.updateEvent(finalGCalId, mergedEventData);
-                   } else {
-                     // Not found on that day. It was likely deleted. Re-create it.
-                     console.log("Event not found on server. Re-creating...");
-                     const resp = await calendarService.current.createEvent(mergedEventData);
-                     finalGCalId = resp.id;
-                   }
-                 } else {
-                   // Some other error, rethrow
-                   throw updateErr;
-                 }
-               }
-             }
-          }
-        } catch (apiErr: any) {
-          console.error("API Sync Failed", apiErr);
-          // Don't block the UI. Show warning but allow local save to proceed.
-          setErrorMsg(`Synced locally, but Google Calendar API failed: ${apiErr.message || 'Unknown error'}`);
-        }
-      }
-
-      // 3. Update Local State (Single Source of Truth)
-      // We update our local list regardless of API success/failure so the user doesn't lose data.
-      let updatedList = [...localEvents];
-
-      if (action.type === ActionType.CREATE) {
-        updatedList.push({
-          ...mergedEventData,
-          localId: crypto.randomUUID(),
-          gcalId: finalGCalId,
-          lastUpdated: new Date().toISOString(),
-        } as LocalEventRecord);
-      } else if (action.type === ActionType.UPDATE && targetRecord) {
-        updatedList = updatedList.map(e => {
-          if (e.localId === targetRecord.localId) {
-            return {
-              ...e,
-              ...mergedEventData,
-              gcalId: finalGCalId, // Update ID (Might have changed in 404 recovery)
-              lastUpdated: new Date().toISOString(),
-            } as LocalEventRecord;
-          }
-          return e;
-        });
-      }
-
-      setLocalEvents(updatedList);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(updatedList));
-
-      // Remove executed action from list
+    // 3. Update Local State
+    updateLocalState(action.type, mergedEventData, finalGCalId, synced, syncError, targetRecord?.localId);
+    
+    // Cleanup UI
+    if (!isAuto) {
       setProposedActions(prev => prev.filter((_, i) => i !== index));
-      if (proposedActions.length === 1) {
-          setInputText(''); // Clear input if all done
-      }
+      if (proposedActions.length === 1) setInputText('');
+    }
+    setIsSyncing(false);
+  };
 
-    } catch (err: any) {
-      console.error(err);
-      setErrorMsg("Error processing action: " + err.message);
+  // Helper to perform the actual API call logic (extracted for retry capability)
+  const performSync = async (type: ActionType, gcalId: string, data: CalendarEventData, targetRecord: LocalEventRecord | null | undefined): Promise<string> => {
+      const isManual = gcalId.startsWith('manual-link-');
+      
+      if (type === ActionType.CREATE || (type === ActionType.UPDATE && isManual)) {
+         const resp = await calendarService.current.createEvent(data);
+         return resp.id;
+      } else {
+         // Update existing real event
+         try {
+           await calendarService.current.updateEvent(gcalId, data);
+           return gcalId;
+         } catch (e: any) {
+           if (e.message.includes('404')) {
+             // 404 Recovery Logic
+             const searchDate = new Date(targetRecord?.startTime || data.startTime);
+             const timeMin = new Date(searchDate); timeMin.setHours(0,0,0,0);
+             const timeMax = new Date(searchDate); timeMax.setHours(23,59,59,999);
+             const dayEvents = await calendarService.current.listEvents(timeMin.toISOString(), timeMax.toISOString());
+             const match = dayEvents.find((e: any) => e.summary === (targetRecord?.summary || data.summary));
+             
+             if (match) {
+               await calendarService.current.updateEvent(match.id, data);
+               return match.id;
+             } else {
+               const resp = await calendarService.current.createEvent(data);
+               return resp.id;
+             }
+           }
+           throw e;
+         }
+      }
+  };
+
+  const updateLocalState = (type: ActionType, data: CalendarEventData, gcalId: string, synced: boolean, error: string | undefined, targetLocalId?: string) => {
+    setLocalEvents(prev => {
+      let next = [...prev];
+      const now = new Date().toISOString();
+      
+      if (type === ActionType.CREATE) {
+        next.push({
+          ...data,
+          localId: crypto.randomUUID(),
+          gcalId,
+          lastUpdated: now,
+          originalText: inputText,
+          synced,
+          error
+        });
+      } else if (type === ActionType.UPDATE && targetLocalId) {
+        next = next.map(e => e.localId === targetLocalId ? {
+          ...e,
+          ...data,
+          gcalId,
+          lastUpdated: now,
+          synced,
+          error: error || undefined // Clear error if success
+        } : e);
+      }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+  };
+
+  // Manual Retry from History Card
+  const handleRetry = async (record: LocalEventRecord) => {
+    setIsSyncing(true);
+    try {
+      // Treat as an 'UPDATE' action but targeting itself
+      const action: ProposedAction = {
+        type: ActionType.UPDATE,
+        confidenceScore: 1,
+        reasoning: "Manual Retry",
+        eventData: record,
+        targetLocalId: record.localId
+      };
+      // Reuse the execute logic which contains the retry/fix loop
+      await handleExecuteAction(action, -1, true); 
     } finally {
       setIsSyncing(false);
     }
@@ -272,11 +295,9 @@ const App: React.FC = () => {
           </div>
           
           <div className="flex flex-col items-end gap-2 w-full md:w-auto">
-            {/* Auth UI */}
             {!isAuthenticated ? (
               <div className="flex flex-col items-end w-full">
                  <div className="flex items-center gap-2">
-                    {/* Toggle Settings */}
                     <button 
                       onClick={() => setShowConfig(!showConfig)}
                       className="text-xs text-slate-400 hover:text-sky-600 underline"
@@ -301,8 +322,6 @@ const App: React.FC = () => {
                  {/* Configuration Panel */}
                  {showConfig && (
                   <div className="flex flex-col items-end w-full max-w-sm animate-fade-in mt-2 bg-white p-4 rounded-lg border border-slate-200 shadow-xl z-20 absolute top-20 right-0 md:relative md:top-0 md:right-0">
-                     
-                     {/* Client ID */}
                      <label className="text-xs text-slate-500 mb-1 w-full text-left font-semibold">Google Client ID</label>
                      <input 
                        type="text" 
@@ -311,8 +330,6 @@ const App: React.FC = () => {
                        placeholder="Enter Client ID..."
                        className="w-full text-sm border border-slate-300 rounded px-2 py-1 focus:ring-2 focus:ring-sky-500 focus:outline-none mb-3"
                      />
-                     
-                     {/* Gemini Base URL (Proxy) */}
                      <label className="text-xs text-slate-500 mb-1 w-full text-left font-semibold">Gemini Base URL (Optional)</label>
                      <input 
                        type="text" 
@@ -321,31 +338,27 @@ const App: React.FC = () => {
                        placeholder="https://my-proxy.com (Default: Google)"
                        className="w-full text-sm border border-slate-300 rounded px-2 py-1 focus:ring-2 focus:ring-sky-500 focus:outline-none mb-3"
                      />
-                     <div className="text-[10px] text-slate-400 w-full text-left mb-3">
-                       Use this to route AI requests through a proxy (e.g., http://localhost:8080).
-                     </div>
-
-                     <div className="bg-slate-50 p-2 rounded border border-slate-200 w-full mb-3 text-left">
-                       <p className="text-[10px] text-slate-400 uppercase tracking-wider font-bold mb-1">Origin for Client ID:</p>
-                       <code className="text-xs text-slate-700 bg-white border border-slate-200 px-1 py-0.5 rounded block break-all select-all">
-                         {currentOrigin || 'Loading...'}
-                       </code>
-                     </div>
-
                      <div className="flex justify-between w-full mt-1 items-center">
-                        <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer" className="text-xs text-sky-600 hover:underline flex items-center gap-1">
-                          Google Cloud Console
-                          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
-                        </a>
                         <button onClick={handleCloseConfig} className="text-xs text-slate-500 hover:text-slate-700 px-2 py-1 rounded hover:bg-slate-100">Done</button>
                      </div>
                   </div>
                  )}
               </div>
             ) : (
-              <div className="flex items-center gap-2 text-emerald-700 bg-emerald-100 px-3 py-1 rounded-full text-sm border border-emerald-200">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                Connected
+              <div className="flex items-center gap-3">
+                 <label className="flex items-center gap-2 cursor-pointer group">
+                   <div className="relative">
+                     <input type="checkbox" className="sr-only" checked={autoTrust} onChange={(e) => setAutoTrust(e.target.checked)} />
+                     <div className={`w-8 h-4 rounded-full shadow-inner transition-colors ${autoTrust ? 'bg-sky-500' : 'bg-slate-300'}`}></div>
+                     <div className={`absolute -top-1 -left-1 w-6 h-6 bg-white rounded-full shadow transition-transform ${autoTrust ? 'translate-x-4' : 'translate-x-0'}`}></div>
+                   </div>
+                   <span className="text-xs font-medium text-slate-500 group-hover:text-sky-600 transition-colors">Auto-Sync</span>
+                 </label>
+
+                <div className="flex items-center gap-2 text-emerald-700 bg-emerald-100 px-3 py-1 rounded-full text-sm border border-emerald-200">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                  Connected
+                </div>
               </div>
             )}
           </div>
@@ -356,7 +369,7 @@ const App: React.FC = () => {
            <div className="bg-amber-50 border border-amber-200 text-amber-800 px-4 py-2 rounded-lg mb-4 text-sm flex justify-between items-center">
              <div className="flex gap-2 items-center">
                <svg className="w-4 h-4 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
-               <span>Preview environment detected. Sign-in may fail.</span>
+               <span>Preview detected. Sign-in may fail.</span>
              </div>
              <a href={window.location.href} target="_blank" rel="noopener noreferrer" className="text-amber-700 underline font-semibold hover:text-amber-900">
                Open in New Window
@@ -364,24 +377,10 @@ const App: React.FC = () => {
            </div>
         )}
 
-        {/* Info Banner for No-Auth Mode */}
-        {!isAuthenticated && (
-          <div className="bg-sky-50 border border-sky-100 text-sky-800 px-4 py-3 rounded-xl mb-6 flex gap-3 text-sm">
-             <svg className="w-5 h-5 text-sky-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-             </svg>
-             <p>
-               <span className="font-semibold">Lite Mode:</span> You are not signed in. The AI will still analyze your messages, but instead of automatically syncing, it will generate <span className="font-semibold">"Open in Calendar"</span> links for you to save manually.
-             </p>
-          </div>
-        )}
-
         {/* Main Content Area */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           
-          {/* Left Column: Input & Actions */}
           <div className="lg:col-span-2 space-y-6">
-            
             {/* Input Section */}
             <div className="bg-white rounded-2xl p-1 shadow-lg shadow-slate-200/50 border border-slate-100">
               <div className="relative">
@@ -427,7 +426,7 @@ const App: React.FC = () => {
               </div>
             )}
 
-            {/* Proposed Actions Area */}
+            {/* Proposed Actions */}
             {proposedActions.length > 0 && (
               <div className="animate-fade-in">
                 <h2 className="text-xl font-semibold mb-4 text-slate-700">Proposed Actions</h2>
@@ -445,7 +444,7 @@ const App: React.FC = () => {
             )}
           </div>
 
-          {/* Right Column: Managed History */}
+          {/* Managed History */}
           <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 h-fit sticky top-4">
              <div className="flex justify-between items-center mb-4">
                <h3 className="font-semibold text-slate-700">Managed Events</h3>
@@ -460,9 +459,9 @@ const App: React.FC = () => {
              ) : (
                <div className="space-y-2 max-h-[500px] overflow-y-auto pr-2">
                  {[...localEvents]
-                   .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())
+                   .sort((a, b) => new Date(b.lastUpdated).getTime() - new Date(a.lastUpdated).getTime())
                    .map(event => (
-                   <HistoryCard key={event.localId} event={event} />
+                   <HistoryCard key={event.localId} event={event} onRetry={handleRetry} />
                  ))}
                </div>
              )}
