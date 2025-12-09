@@ -1,41 +1,26 @@
 
-// Global types for Google APIs
+// Global types for Google Identity Services
 declare global {
   interface Window {
-    gapi: any;
     google: any;
   }
 }
 
-const DISCOVERY_DOC = 'https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest';
 const SCOPES = 'https://www.googleapis.com/auth/calendar.events';
 
 export class CalendarService {
   private tokenClient: any;
-  private gapiInited = false;
-  private gisInited = false;
   private accessToken: string | null = null;
 
   constructor() {
-    this.initializeGapi();
     // If env var is present at build time, try to init immediately
     if (process.env.GOOGLE_CLIENT_ID) {
       this.initializeGis(process.env.GOOGLE_CLIENT_ID);
     }
   }
 
-  private initializeGapi() {
-    if(!window.gapi) return;
-    window.gapi.load('client', async () => {
-      await window.gapi.client.init({
-        discoveryDocs: [DISCOVERY_DOC],
-      });
-      this.gapiInited = true;
-    });
-  }
-
   public initializeGis(clientId: string) {
-    if(!window.google) {
+    if (!window.google) {
       console.warn("Google Identity Services script not loaded yet.");
       return;
     }
@@ -46,12 +31,12 @@ export class CalendarService {
         scope: SCOPES,
         callback: (resp: any) => {
           if (resp.error !== undefined) {
+            console.error("GIS Error:", resp);
             throw resp;
           }
           this.accessToken = resp.access_token;
         },
       });
-      this.gisInited = true;
     } catch (e) {
       console.error("Failed to initialize Token Client", e);
       throw e;
@@ -75,11 +60,9 @@ export class CalendarService {
         }
       };
 
-      if (window.gapi.client.getToken() === null) {
-        this.tokenClient.requestAccessToken({ prompt: 'consent' });
-      } else {
-        this.tokenClient.requestAccessToken({ prompt: '' });
-      }
+      // Always request consent to ensure we get a fresh token if needed
+      // In a prod app, you might check validity first
+      this.tokenClient.requestAccessToken({ prompt: '' });
     });
   }
 
@@ -87,14 +70,11 @@ export class CalendarService {
     return !!this.accessToken;
   }
 
-  // --- API Methods (Authenticated) ---
+  // --- API Methods (Authenticated via fetch) ---
 
   public async createEvent(event: any): Promise<any> {
     if (!this.accessToken) throw new Error("Not authenticated");
     
-    // Ensure gapi client is set with token
-    window.gapi.client.setToken({ access_token: this.accessToken });
-
     const resource = {
       summary: event.summary,
       location: event.location,
@@ -109,18 +89,25 @@ export class CalendarService {
       },
     };
 
-    const response = await window.gapi.client.calendar.events.insert({
-      'calendarId': 'primary',
-      'resource': resource,
+    const response = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(resource)
     });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error?.message || 'Failed to create event');
+    }
     
-    return response.result;
+    return await response.json();
   }
 
   public async updateEvent(eventId: string, event: any): Promise<any> {
     if (!this.accessToken) throw new Error("Not authenticated");
-
-     window.gapi.client.setToken({ access_token: this.accessToken });
 
      const resource: any = {
        summary: event.summary,
@@ -142,13 +129,21 @@ export class CalendarService {
        };
      }
 
-     const response = await window.gapi.client.calendar.events.patch({
-       'calendarId': 'primary',
-       'eventId': eventId,
-       'resource': resource
+     const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`, {
+       method: 'PATCH',
+       headers: {
+         'Authorization': `Bearer ${this.accessToken}`,
+         'Content-Type': 'application/json',
+       },
+       body: JSON.stringify(resource)
      });
 
-     return response.result;
+     if (!response.ok) {
+       const errorData = await response.json();
+       throw new Error(errorData.error?.message || 'Failed to update event');
+     }
+
+     return await response.json();
   }
 
   // --- Utility Methods (No Auth Required) ---
