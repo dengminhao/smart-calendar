@@ -34,3 +34,12 @@ export interface ProposedAction {
 export interface GeminiResponse {
   actions: ProposedAction[];
 }
+
+export type AIProvider = 'GEMINI' | 'OPENAI';
+
+export interface AIConfig {
+  provider: AIProvider;
+  apiKey: string;
+  baseUrl?: string;
+  model?: string;
+}

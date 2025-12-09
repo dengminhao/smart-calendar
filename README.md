@@ -1,20 +1,45 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Smart Calendar Sync
 
-# Run and deploy your AI Studio app
+An intelligent assistant that parses IM messages to automatically create or update Google Calendar events.
 
-This contains everything you need to run your app locally.
+## Environment Setup
 
-View your app in AI Studio: https://ai.studio/apps/drive/189AZAx4-VX_LxDcMZ8WzDRcN4a6tuXsD
+You can configure the AI provider (Gemini or OpenAI) and API keys using a `.env.local` file in the root directory.
 
-## Run Locally
+### `.env.local` Example
 
-**Prerequisites:**  Node.js
+```ini
+# --- Google Calendar Configuration ---
+# Required for Google Calendar Sync
+GOOGLE_CLIENT_ID=your-google-oauth-client-id
 
+# --- AI Configuration ---
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+# Default Provider: 'GEMINI' or 'OPENAI'
+# If not set, defaults to GEMINI
+AI_PROVIDER=OPENAI
+
+# --- Gemini Configuration ---
+# Required if AI_PROVIDER is GEMINI
+API_KEY=your-gemini-api-key
+# Optional: Proxy for Gemini
+# GEMINI_BASE_URL=https://your-proxy.com
+
+# --- OpenAI Configuration ---
+# Required if AI_PROVIDER is OPENAI
+OPENAI_API_KEY=sk-your-openai-api-key
+# Optional: Model (defaults to gpt-4o)
+OPENAI_MODEL=gpt-4o
+# Optional: Proxy for OpenAI
+OPENAI_BASE_URL=https://api.openai.com
+```
+
+### Running Locally
+
+1. `npm install`
+2. Create `.env.local` with the above values.
+3. `npm run dev`
+
+### Switching Providers in UI
+
+You can also switch providers dynamically in the web interface by clicking the **"Settings"** button in the top right corner. Configurations saved in the browser (LocalStorage) will override environment variables.
